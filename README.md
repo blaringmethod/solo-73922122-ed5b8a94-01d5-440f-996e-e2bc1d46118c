@@ -30,10 +30,22 @@ s.t.  A w = p                # 每行一个目标人群，A 为 0/1 成员矩阵
 - 任何一次已提交的样本或目标修改（即使内容与原来完全相同、即使之后又改回去）
   都会使全局版本号 `epoch` 加一：所有历史作业被删除、在途计算通过取消事件
   永久放弃且不写结果。旧结果不会因“改回原值”而恢复，必须重新计算。
+- 作业创建在单个数据库事务内完成：快照与 `epoch` 属于同一版本，不会出现
+  “快照是旧数据、版本号是新值”的作业。
+- **结果发布是事务性的**：只有在事务内重新核对“作业仍存在、作业 `epoch`
+  等于当前 `epoch`、作业尚未终态”后才写入完整权重并 `COMMIT`。`COMMIT`
+  失败即回滚，因此：
+  - 未提交的权重对 `GET /jobs/{id}` 与 `GET /result` 永远不可见；
+  - 该事务不会被后续写入（例如再提交一笔计算）顺带提交；
+  - 所有查询与写入共用同一把锁，**发布期间发起的查询会等待**，只能看到
+    提交前（无结果）或提交后（完整结果）的状态。
+- 保存失败后，若数据库仍可写且作业仍然有效，作业会显示为 `failed` 并附
+  “保存失败”说明（不携带任何权重）。若作业已因样本/目标更正失效，则不做
+  任何写入，**绝不复活旧作业**。
 - 只有作业成功结束时才原子写入**完整**权重结果；`queued/running/failed/
   infeasible/interrupted` 状态均不返回任何半份权重。
-- 进程重启后，未完成作业标记为 `interrupted`；`GET /result` 仅提供与当前
-  输入逐字段一致的完整结果，否则返回 `409`。
+- 进程重启后，未完成作业标记为 `interrupted`；`GET /result` 仅提供当前版本
+  最近一次**成功提交**的完整结果，并逐字段核对输入快照，否则返回 `409`。
 
 ## 快速启动（Docker Compose）
 
@@ -45,13 +57,29 @@ docker compose up --build
 #   http://localhost:8000/openapi.json
 ```
 
+容器首次启动时若数据库为空，会自动装载 `examples/feasible_*`（服务行为由
+`WEIGHTS_SEED=0` 关闭）。因此打开 <http://localhost:8000/docs> 后可直接：
+
+1. `POST /calculate` → 复制返回的 `job_id`；
+2. `GET /jobs/{job_id}` → 查看完整权重；
+3. `GET /result` → 取用当前版本结果；
+4. `PUT /samples` 或 `PUT /targets` 后再 `GET /result` → 返回 `409`，验证失效语义。
+
 SQLite 数据库保存在命名卷 `weights-data`（容器内 `/data/weights.db`）。
+可选的一次性端到端演示（容器网络内）：
+
+```bash
+docker compose run --rm demo
+```
 
 ## 本地无 Docker 运行（可选）
 
 ```bash
 python3 -m pip install -r requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+# 可选：空库时装载示例数据（容器外自动使用仓库内 examples/）
+python3 -c "from app.db import Database; from app.demo_seed import load_examples; \
+db = Database('weights.db'); load_examples(db); db.close()"
+WEIGHTS_DB=weights.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 ## 接口一览
@@ -65,7 +93,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/calculate` | 提交后台计算，返回 `job_id`（202） |
 | GET | `/jobs/{job_id}` | 查询作业；成功时含完整权重与输入快照 |
 | GET | `/jobs` | 最近作业列表 |
-| GET | `/result` | 取用与当前输入一致的完整权重，否则 409 |
+| GET | `/result` | 取当前版本最近一次成功提交的完整权重，否则 409 |
 | GET | `/health` | 健康检查 |
 
 输入为严格整数：`d` 必须是 1–100 的整数（布尔值、小数、越界均 422），
@@ -105,4 +133,6 @@ pytest -q
 
 覆盖：随机可行案例的 KKT 最优性、200×12 满规模、冗余等式、零/未覆盖目标、
 IIS 最小性、边界解、严格校验、失效语义、在途修改取消、重启中断、
-数值失败与无解的区分。
+数值失败与无解的区分，以及结果发布一致性：`COMMIT` 失败回滚后权重不可见、
+不会被后续写入顺带保存、发布期间查询只看到已提交状态、保存失败仅在作业
+仍有效时显示为 `failed`、失效作业绝不因保存失败兜底而复活。

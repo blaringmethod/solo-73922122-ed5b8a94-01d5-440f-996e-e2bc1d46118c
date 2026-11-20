@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
-from .db import Database
+from .db import Database, EmptyInputError, EpochChangedError
 from .jobs import JobManager
 from .schemas import (
     JobResult,
@@ -24,7 +24,9 @@ DB_PATH = os.environ.get("WEIGHTS_DB", "/data/weights.db")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    # SQLite 文件路径可能没有目录部分（如 WEIGHTS_DB=a.db）
+    db_dir = os.path.dirname(os.path.abspath(DB_PATH))
+    os.makedirs(db_dir, exist_ok=True)
     app.state.db = Database(DB_PATH)
     app.state.jobs = JobManager(app.state.db)
     yield
@@ -87,12 +89,16 @@ def get_targets():
 @app.post("/calculate", status_code=202, tags=["计算"],
           summary="提交后台权重计算（不阻塞，返回 job_id）")
 def calculate():
-    snap = db().snapshot()
-    if not snap["samples"]:
-        raise HTTPException(422, "当前没有样本，无法计算：请先 PUT /samples")
-    if not snap["targets"]:
+    # 作业创建（含快照读取与空输入检查）是单个数据库事务，
+    # 不会与并发的样本/目标更正产生“快照与 epoch 错位”的作业。
+    try:
+        job = jobs().submit()
+    except EmptyInputError as exc:
+        if exc.what == "samples":
+            raise HTTPException(422, "当前没有样本，无法计算：请先 PUT /samples")
         raise HTTPException(422, "当前没有目标，无法计算：请先 PUT /targets")
-    job = jobs().submit()
+    except EpochChangedError:
+        raise HTTPException(409, "输入在提交计算时已变化，请重试")
     return JSONResponse(
         status_code=202,
         content={"job_id": job["job_id"], "epoch": job["epoch"],
@@ -150,23 +156,16 @@ def get_job(job_id: str):
 @app.get("/result", tags=["计算"],
          summary="取用与当前输入一致的完整权重；无可用完整结果时返回 409")
 def get_result():
-    row = db().latest_succeeded_job()
+    # 在同一把锁内取当前版本最近一次成功提交的作业并与当前输入核对：
+    # 发布事务提交前不可见，回滚/保存失败后也不可见。
+    row = db().current_result()
     if row is None:
         raise HTTPException(
             409,
             "当前没有与现有输入一致的完整权重结果（尚未计算、计算中、冲突、"
-            "数值失败或进程重启均不开放半份结果）",
+            "数值失败、保存失败或进程重启均不开放半份结果）",
         )
-    data = _serialize_job(dict(row))
-    # 一致性核对：作业快照必须与当前输入逐字段一致
-    current = db().snapshot()
-    snap = data["input_snapshot"]
-    if snap.get("samples") != current["samples"] or \
-            snap.get("targets") != current["targets"] or \
-            snap.get("epoch") != current["epoch"]:
-        # 理论上不会发生（epoch 变更即清除作业），双保险
-        raise HTTPException(409, "结果与当前输入不一致，已拒绝取用，请重新计算")
-    return data
+    return _serialize_job(row)
 
 
 @app.get("/health", tags=["系统"], summary="健康检查")

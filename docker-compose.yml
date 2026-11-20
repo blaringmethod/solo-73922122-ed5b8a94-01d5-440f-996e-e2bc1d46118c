@@ -9,13 +9,29 @@ services:
       - weights-data:/data
     environment:
       WEIGHTS_DB: /data/weights.db
+      # 空库时自动装载 examples/feasible_*，便于直接打开 /docs 试调；
+      # 设为 0 可禁用。
+      WEIGHTS_SEED: "1"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status==200 else 1)"]
       interval: 15s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 15s
+
+  # 可选：一次性运行端到端演示（不常驻）。
+  #   docker compose run --rm demo
+  demo:
+    build: .
+    image: survey-weights-api:1.0.0
+    profiles: ["demo"]
+    depends_on:
+      weights-api:
+        condition: service_healthy
+    entrypoint: ["python", "-u", "/srv/examples/demo.py"]
+    command: ["http://weights-api:8000"]
+    restart: "no"
 
 volumes:
   weights-data:
